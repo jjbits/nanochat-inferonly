@@ -7,6 +7,19 @@ from model import GPT, GPTConfig
 from tokenizer import Tokenizer
 
 
+def _patch_missing_keys(model_data, config):
+    """
+    Patch missing keys in old checkpoints for backwards compatibility.
+    Adds default values for learnable lambdas if they don't exist.
+    """
+    # Patch learnable lambdas (added in later versions)
+    if "resid_lambdas" not in model_data:
+        model_data["resid_lambdas"] = torch.ones(config.n_layer)
+    if "x0_lambdas" not in model_data:
+        model_data["x0_lambdas"] = torch.zeros(config.n_layer)
+    return model_data
+
+
 def get_cache_dir():
     """Get the cache directory for downloaded files."""
     cache_dir = os.environ.get("NANOCHAT_CACHE_DIR")
@@ -104,6 +117,9 @@ def load_model(repo_id="karpathy/nanochat-d32", device=None):
     config = GPTConfig(**meta["model_config"])
     print(f"Model config: {config}")
 
+    # Patch missing keys for backwards compatibility
+    model_data = _patch_missing_keys(model_data, config)
+
     with torch.device("meta"):
         model = GPT(config)
 
@@ -161,6 +177,9 @@ def load_model_from_local(model_path, meta_path, tokenizer_path, device=None):
 
     # Build model
     config = GPTConfig(**meta["model_config"])
+
+    # Patch missing keys for backwards compatibility
+    model_data = _patch_missing_keys(model_data, config)
 
     with torch.device("meta"):
         model = GPT(config)
