@@ -15,24 +15,12 @@ Architecture:
 """
 
 from dataclasses import dataclass
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Detect if we can use Flash Attention 3 (requires Hopper GPU with compute capability >= 9.0)
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-USE_FA3 = False
-flash_attn = None
-if torch.cuda.is_available():
-    major, _ = torch.cuda.get_device_capability()
-    if major >= 9:  # Hopper (H100) or newer
-        try:
-            from kernels import get_kernel
-            flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
-            USE_FA3 = True
-        except Exception as e:
-            print(f"FA3 not available, falling back to SDPA: {e}")
+# Unified Flash Attention interface (FA3 on Hopper+, SDPA fallback elsewhere)
+from flash_attention import flash_attn
 
 
 @dataclass
@@ -92,55 +80,24 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)  # QK norm
 
-        if USE_FA3:
-            # Attention with Flash Attention 3
-            # FA3 handles GQA automatically when n_kv_heads < n_heads
-            # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-            if kv_cache is None:
-                # Training: causal attention with optional sliding window
-                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-            else:
-                # Inference: use flash_attn_with_kvcache which handles cache management
-                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-                y = flash_attn.flash_attn_with_kvcache(
-                    q, k_cache, v_cache,
-                    k=k, v=v,
-                    cache_seqlens=kv_cache.cache_seqlens,
-                    causal=True,
-                    window_size=window_size,
-                )
-                # Advance position after last layer processes
-                if self.layer_idx == kv_cache.n_layers - 1:
-                    kv_cache.advance(T)
+        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        if kv_cache is None:
+            # Training: causal attention with optional sliding window
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
-            # Fallback to PyTorch SDPA (for non-Hopper GPUs, CPU, MPS)
-            # SDPA uses (B, H, T, D) layout, so transpose
-            q = q.transpose(1, 2)  # (B, H, T, D)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
-            if kv_cache is not None:
-                # SDPA-style KV cache: insert and get full cache
-                k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-
-            Tq, Tk = q.size(2), k.size(2)
-            enable_gqa = self.n_head != self.n_kv_head
-
-            if kv_cache is None or Tq == Tk:
-                # Training or prefill: use causal mask
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-            elif Tq == 1:
-                # Decode: single token, attend to all cached tokens
-                y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
-            else:
-                # Partial prefill with existing cache
-                attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
-                prefix_len = Tk - Tq
-                attn_mask[:, :prefix_len] = True
-                attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
-
-            y = y.transpose(1, 2)  # Back to (B, T, H, D)
+            # Inference: use flash_attn_with_kvcache which handles cache management
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=window_size,
+            )
+            # Advance position after last layer processes
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
