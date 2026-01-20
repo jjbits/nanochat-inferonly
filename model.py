@@ -34,11 +34,20 @@ class GPTConfig:
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     window_pattern: str = "L"
+    # Value embeddings (ResFormer-style) - disabled by default for backwards compat
+    use_ve: bool = False
 
 
 def norm(x):
     """RMSNorm with no learnable parameters."""
     return F.rms_norm(x, (x.size(-1),))
+
+
+def has_ve(layer_idx, config):
+    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    if not config.use_ve:
+        return False
+    return layer_idx % 2 == (config.n_layer - 1) % 2
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -65,8 +74,10 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.ve_gate_channels = 32
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config) else None
 
-    def forward(self, x, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -74,6 +85,12 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
+            v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys
         cos, sin = cos_sin
@@ -124,8 +141,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -147,6 +164,10 @@ class GPT(nn.Module):
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        head_dim = config.n_embd // config.n_head
+        kv_dim = config.n_kv_head * head_dim
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config)})
 
         # Rotary embeddings (over-compute by 10x for safety)
         self.rotary_seq_len = config.sequence_len * 10
@@ -209,7 +230,8 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Logits with soft-capping

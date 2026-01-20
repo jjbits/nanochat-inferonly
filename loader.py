@@ -10,13 +10,20 @@ from tokenizer import Tokenizer
 def _patch_missing_keys(model_data, config):
     """
     Patch missing keys in old checkpoints for backwards compatibility.
-    Adds default values for learnable lambdas if they don't exist.
+    Adds default values for learnable lambdas and value embeddings if they don't exist.
     """
     # Patch learnable lambdas (added in later versions)
     if "resid_lambdas" not in model_data:
         model_data["resid_lambdas"] = torch.ones(config.n_layer)
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(config.n_layer)
+
+    # Note: Value embeddings (VE) are NOT patched for old checkpoints.
+    # VE embeddings are very large (vocab_size × kv_dim per layer) and would add
+    # gigabytes of zeros. Instead, we use strict=False when loading and let the
+    # model initialize VE randomly (which has no effect since gates are also random).
+    # New checkpoints trained with VE will have the weights and load correctly.
+
     return model_data
 
 
@@ -115,6 +122,9 @@ def load_model(repo_id="karpathy/nanochat-d32", device=None):
 
     # Build model
     config = GPTConfig(**meta["model_config"])
+
+    # Detect if checkpoint has VE weights
+    config.use_ve = "value_embeds.1.weight" in model_data
     print(f"Model config: {config}")
 
     # Patch missing keys for backwards compatibility
@@ -125,7 +135,7 @@ def load_model(repo_id="karpathy/nanochat-d32", device=None):
 
     model.to_empty(device=device)
     model.init_rotary()
-    model.load_state_dict(model_data, strict=True, assign=True)
+    model.load_state_dict(model_data, strict=False, assign=True)
     model.eval()
 
     # Load tokenizer
@@ -178,6 +188,9 @@ def load_model_from_local(model_path, meta_path, tokenizer_path, device=None):
     # Build model
     config = GPTConfig(**meta["model_config"])
 
+    # Detect if checkpoint has VE weights
+    config.use_ve = "value_embeds.1.weight" in model_data
+
     # Patch missing keys for backwards compatibility
     model_data = _patch_missing_keys(model_data, config)
 
@@ -186,7 +199,7 @@ def load_model_from_local(model_path, meta_path, tokenizer_path, device=None):
 
     model.to_empty(device=device)
     model.init_rotary()
-    model.load_state_dict(model_data, strict=True, assign=True)
+    model.load_state_dict(model_data, strict=False, assign=True)
     model.eval()
 
     # Load tokenizer

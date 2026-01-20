@@ -13,7 +13,7 @@ class KVCache:
     Works with both FA3 (Hopper+) and SDPA fallback via flash_attention module.
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype=torch.bfloat16):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
         self.batch_size = batch_size
         self.max_seq_len = seq_len
         self.n_layers = num_layers
@@ -91,6 +91,8 @@ class Engine:
         """
         assert isinstance(tokens, list) and isinstance(tokens[0], int)
         device = self.model.get_device()
+        # Determine dtype based on device (cuda=bf16, else=fp32)
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
@@ -105,6 +107,7 @@ class Engine:
             "head_dim": m.n_embd // m.n_head,
             "num_layers": m.n_layer,
             "device": device,
+            "dtype": dtype,
         }
         kv_cache_prefill = KVCache(batch_size=1, seq_len=len(tokens), **kv_kwargs)
 
