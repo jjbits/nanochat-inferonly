@@ -4,7 +4,7 @@ Inference-only extraction from [karpathy/nanochat](https://github.com/karpathy/n
 
 This project contains the minimal components needed to run inference with nanochat models, without the training code.
 
-## Inference Speed Comparison
+## Inference Speed
 
 **Hardware:** NVIDIA GeForce RTX 4090, CUDA 12.8
 
@@ -12,17 +12,17 @@ This project contains the minimal components needed to run inference with nanoch
 
 **Test Configuration:**
 - Prompt tokens: 16
-- Max generate tokens: 128 (actual: 80)
+- Generated tokens: 80
 - Decoding: greedy (temperature=0)
-- Warmup runs: 2
-- Benchmark runs: 5
+- Runs: 5 (after 2 warmup)
 
-| Implementation | Prefill | Decode | Total |
-|----------------|---------|--------|-------|
-| nanochat-inferonly | 774.7 tok/s | 63.9 tok/s | 75.5 tok/s |
-| nanochat | 779.1 tok/s | 65.3 tok/s | 77.0 tok/s |
+| Metric | Throughput |
+|--------|------------|
+| Prefill | 681.5 tok/s |
+| Decode | 57.4 tok/s |
+| Total | 67.7 tok/s |
 
-Using PyTorch SDPA.
+Using PyTorch SDPA (FA3 on Hopper+, SDPA fallback elsewhere).
 
 ## License
 
